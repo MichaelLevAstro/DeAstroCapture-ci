@@ -1,0 +1,211 @@
+name: build
+
+# This repository holds no source. It exists because GitHub bills Actions
+# minutes to the repository the workflow runs in, and standard runners are free
+# on a public one, while a private repository pays a ten-times multiplier on
+# every macOS minute. The application is checked out of its own private
+# repository with a read-only token, built here, and left as an artifact.
+#
+# Manual only. Nothing is ever pushed to this repository, so a push trigger
+# would have nothing to react to. Start a run from the Actions tab, or:
+#
+#     gh workflow run build.yml -R MichaelLevAstro/DeAstroCapture-ci -f ref=main
+#
+# The tests are deliberately not run here. Runs, logs and artifacts on a public
+# repository are readable by anyone, and a failing assertion prints the source
+# lines around it - which belong to a private repository. build.py's own
+# --selftest still runs on every leg: it catches a bundle that lost OpenCV, the
+# fonts, a camera library or the Qt platform plugin, and prints no source.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA of DeAstroCapture to build"
+        type: string
+        default: main
+      release:
+        description: "Publish the installers as a release the app can update from"
+        type: boolean
+        default: false
+      stage:
+        description: "Shown after the version in the release's name (Alpha, Beta, or empty)"
+        type: string
+        default: Alpha
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest glibc PySide6's x86_64 wheels take (2.34): a binary built
+          # against a newer one will not start on an older distro.
+          - os: ubuntu-22.04
+            label: linux-x86_64
+            artifact: dist/*.tar.gz
+          # A 64-bit Raspberry Pi. PySide6's aarch64 wheels want glibc 2.39, so
+          # 24.04 it is - and the result runs on Raspberry Pi OS Trixie (Debian
+          # 13) or Ubuntu 24.04 and later, not on Bookworm.
+          - os: ubuntu-24.04-arm
+            label: linux-arm64
+            artifact: dist/*.tar.gz
+          # The standard three-core M1 image, which is the free tier for a
+          # public repository. The xlarge macOS labels are billed even here.
+          - os: macos-14
+            label: macos-arm64
+            artifact: dist/*.dmg
+          # macos-13 was the last Intel image and has been retired; a job asking
+          # for it queues for ever rather than failing. macos-15-intel is the
+          # replacement, and an Intel Mac cannot run an arm64 build at all.
+          - os: macos-15-intel
+            label: macos-x86_64
+            artifact: dist/*.dmg
+          - os: windows-latest
+            label: windows
+            artifact: dist/*-Setup.exe
+
+    steps:
+      # persist-credentials: false keeps the token out of .git/config. A public
+      # repository's workspace is not somewhere to leave a credential that can
+      # read a private one.
+      - name: Source
+        uses: actions/checkout@v4
+        with:
+          repository: MichaelLevAstro/DeAstroCapture
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # PySide6 links these at import time, and build.py runs the packaged
+      # binary with --selftest before packaging it. libusb and libudev are what
+      # ZWO's and Player One's libraries load.
+      - name: Qt and USB runtime libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 \
+            libdbus-1-3 libfontconfig1 libusb-1.0-0 libudev1
+
+      # ZWO's and Player One's Mac libraries want libusb beside them and their
+      # SDKs leave it out: the spec bundles Homebrew's.
+      - name: libusb
+        if: runner.os == 'macOS'
+        run: brew install libusb
+
+      # The Rust kernels (rust/dac_fast). Default targets only, no
+      # target-cpu=native: one build runs on every machine of its kind.
+      - uses: dtolnay/rust-toolchain@stable
+
+      # build.py treats a missing Inno Setup as a note rather than a failure, so
+      # without this the Windows leg would quietly produce no installer and only
+      # fall over at the upload.
+      - name: Inno Setup
+        if: runner.os == 'Windows'
+        run: choco install innosetup -y --no-progress
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      # Builds the Rust kernels and, off Windows, fetches the camera makers'
+      # libraries (packaging/sdks.json, each file checked by its SHA-256).
+      - name: Build and package
+        run: python build.py
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeAstroCapture-${{ matrix.label }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # One release per version, with every platform's installer on it. This is
+  # what the app's own update check reads (deastrocapture/updates.py) and what
+  # the download button on dekoiastro.com links to.
+  #
+  # The stage goes in the release's name only. It is not GitHub's prerelease
+  # flag: a prerelease is skipped by /releases/latest, which is the one address
+  # both the app and the website ask.
+  release:
+    name: release
+    needs: build
+    if: inputs.release
+    runs-on: ubuntu-latest
+    steps:
+      # the source again, for the version, and nothing else of it is used.
+      - name: Source
+        uses: actions/checkout@v4
+        with:
+          repository: MichaelLevAstro/DeAstroCapture
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+
+      # read as text rather than imported: importing the package pulls numpy.
+      - name: Read the version
+        id: version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' deastrocapture/__init__.py)
+          test -n "$version" || { echo 'no __version__ found'; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
+      # flattened, and renamed to carry the platform: two files called
+      # DeAstroCapture.dmg in two folders are two files a browser cannot tell
+      # apart once they are in the same download directory
+      - name: Gather the installers
+        shell: bash
+        run: |
+          mkdir -p release
+          for one in downloaded/*/*; do
+            [ -f "$one" ] || continue
+            cp "$one" "release/$(basename "$(dirname "$one")")-$(basename "$one")"
+          done
+          ls -l release
+          test -n "$(ls -A release)" || { echo 'nothing to release'; exit 1; }
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: DeAstroCapture ${{ steps.version.outputs.version }} ${{ inputs.stage }}
+          files: release/*
+          fail_on_unmatched_files: true
+          body: |
+            DeAstroCapture ${{ steps.version.outputs.version }} ${{ inputs.stage }}.
+
+            ${{ inputs.stage != '' && format('**{0}**: early and still changing. Test it on a night you can afford to lose before trusting it with one you cannot.', inputs.stage) || '' }}
+
+            **macOS**: the app is not signed by Apple, so the first launch is
+            refused. One line clears it, and it is only ever needed once:
+
+            ```
+            xattr -dr com.apple.quarantine /Applications/DeAstroCapture.app
+            ```
+
+            **Windows**: SmartScreen will warn for the same reason - More info,
+            then Run anyway.
+
+            **Linux and Raspberry Pi**: the `linux-arm64` archive is for a
+            64-bit Raspberry Pi on Raspberry Pi OS Trixie (Debian 13) or Ubuntu
+            24.04 and later.
