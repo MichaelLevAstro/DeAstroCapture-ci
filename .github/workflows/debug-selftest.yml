@@ -1,0 +1,56 @@
+name: debug-selftest
+
+# Temporary: where does --selftest stop on macOS. Builds without the self-test,
+# then runs it in the background and dumps its Python stack with py-spy.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15-intel, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MichaelLevAstro/DeAstroCapture
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: brew install libusb
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt py-spy
+      - run: python build.py --no-selftest --no-installer
+      - name: Self-test with stack dumps
+        shell: bash
+        run: |
+          exe=$(find dist -path '*Contents/MacOS/DeAstroCapture' -type f | head -1)
+          echo "exe=$exe"
+          "$exe" --selftest > selftest.log 2>&1 &
+          pid=$!
+          for wait in 30 60 120 240; do
+            sleep $(( wait - ${last:-0} )); last=$wait
+            if ! kill -0 $pid 2>/dev/null; then echo "exited by ${wait}s"; break; fi
+            echo "=== ${wait}s ==="
+            sudo py-spy dump --pid $pid --native || sudo py-spy dump --pid $pid || true
+          done
+          kill $pid 2>/dev/null || true
+          echo "=== output ==="
+          cat selftest.log
