@@ -32,6 +32,10 @@ on:
         description: "Shown after the version in the release's name (Alpha, Beta, or empty)"
         type: string
         default: Alpha
+      mobile_ref:
+        description: "Branch, tag or SHA of DeCapture-Mobile (the phone app) to build"
+        type: string
+        default: main
 
 permissions:
   contents: write
@@ -137,6 +141,73 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # The phone app, from its own private repository (DeCapture-Mobile; the same
+  # read-only token covers it). Release-signed with the one key kept in this
+  # repository's secrets: Android installs an update over the app only when both
+  # are signed with the same key, so a throwaway debug key would mean
+  # uninstalling - and losing the paired rigs - at every version.
+  #
+  # AGP's injected signing properties sign it without the app's build knowing
+  # anything of the key. The keystore is written to the runner's temp folder and
+  # removed after, success or not.
+  android:
+    name: android
+    runs-on: ubuntu-latest
+    steps:
+      - name: Source
+        uses: actions/checkout@v4
+        with:
+          repository: MichaelLevAstro/DeCapture-Mobile
+          ref: ${{ inputs.mobile_ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Signing key
+        shell: bash
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+        run: |
+          test -n "$KEYSTORE" || { echo 'ANDROID_KEYSTORE is not set'; exit 1; }
+          echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
+
+      - name: Build
+        shell: bash
+        env:
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :androidApp:assembleRelease \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.jks" \
+            -Pandroid.injected.signing.store.password="$STORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$STORE_PASSWORD"
+          version=$(sed -n 's/^ *versionName = "\(.*\)"/\1/p' androidApp/build.gradle.kts)
+          test -n "$version" || { echo 'no versionName found'; exit 1; }
+          mkdir -p dist
+          cp androidApp/build/outputs/apk/release/androidApp-release.apk "dist/DeAstroCapture-$version.apk"
+          ls -l dist
+
+      - name: Forget the key
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/release.jks"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeAstroCapture-android
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
   # One release per version, with every platform's installer on it. This is
   # what the app's own update check reads (deastrocapture/updates.py) and what
   # the download button on dekoiastro.com links to.
@@ -146,7 +217,7 @@ jobs:
   # both the app and the website ask.
   release:
     name: release
-    needs: build
+    needs: [build, android]
     if: inputs.release
     runs-on: ubuntu-latest
     steps:
@@ -207,6 +278,9 @@ jobs:
 
             **Windows**: SmartScreen will warn for the same reason - More info,
             then Run anyway.
+
+            **Android**: the phone app, an APK installed by hand - allow
+            installs from your browser or file manager when Android asks.
 
             **Linux and Raspberry Pi**: the `linux-arm64` archive is for a
             64-bit Raspberry Pi on Raspberry Pi OS Trixie (Debian 13) or Ubuntu
