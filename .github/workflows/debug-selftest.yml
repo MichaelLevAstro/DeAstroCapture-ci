@@ -45,12 +45,16 @@ jobs:
           echo "exe=$exe"
           "$exe" --selftest > selftest.log 2>&1 &
           pid=$!
-          for wait in 30 60 120 240; do
-            sleep $(( wait - ${last:-0} )); last=$wait
-            if ! kill -0 $pid 2>/dev/null; then echo "exited by ${wait}s"; break; fi
-            echo "=== ${wait}s ==="
-            sudo py-spy dump --pid $pid --native || sudo py-spy dump --pid $pid || true
-          done
+          sleep 60
+          if kill -0 $pid 2>/dev/null; then
+            sudo py-spy dump --pid $pid || true
+            sample $pid 3 -file sample.txt >/dev/null 2>&1 || sudo sample $pid 3 -file sample.txt >/dev/null 2>&1 || true
+            echo "=== native ==="
+            # threads' call trees, library frames only
+            sed -n '/^Call graph:/,/^Total number in stack/p' sample.txt | grep -E "Thread_|dlopen|ImageLoader|dyld|libEAF|libtoupcam|libnncam|libogmacam|libaltaircam|libsvbony|IOKit|IOHID|dispatch_sync|_dispatch|CFRunLoop|libusb|pthread_cond|pthread_mutex|__psynch|semaphore|PyEval|take_gil" | sed 's/  */ /g' | cut -c1-160 | head -300
+          else
+            echo "exited"
+          fi
           kill $pid 2>/dev/null || true
           echo "=== output ==="
           cat selftest.log
