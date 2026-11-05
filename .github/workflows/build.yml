@@ -55,9 +55,11 @@ jobs:
           - os: ubuntu-24.04-arm
             label: linux-arm64
             artifact: dist/*.tar.gz
-          # The standard three-core M1 image, which is the free tier for a
+          # The standard Apple Silicon image, which is the free tier for a
           # public repository. The xlarge macOS labels are billed even here.
-          - os: macos-14
+          # macos-14 is refused now ("not supported"), and ZWO's arm64 Mac
+          # libraries want macOS 15 anyway.
+          - os: macos-15
             label: macos-arm64
             artifact: dist/*.dmg
           # macos-13 was the last Intel image and has been retired; a job asking
